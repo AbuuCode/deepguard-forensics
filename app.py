@@ -3,24 +3,39 @@ import json
 import hashlib
 import subprocess
 from datetime import datetime
-
+ 
 from flask import Flask, request, render_template, jsonify
 from werkzeug.utils import secure_filename
-
+from flasgger import Swagger  # NEW: API documentation library
+ 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['MAX_CONTENT_LENGTH'] = 900 * 1024 * 1024  # FIX 9: 900 MB upload limit
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500 MB upload limit
 ALLOWED_EXTENSIONS = {'mp4', 'mov', 'avi', 'mkv', 'webm', 'flv'}
-
-# FIX 5: Create uploads folder at module load time, not only inside __main__
-# so it works when deployed via gunicorn or any other WSGI server
+ 
+# NEW: Swagger/Flasgger configuration
+app.config['SWAGGER'] = {
+    'title': 'DeepGuard Forensics API',
+    'uiversion': 3,
+    'description': 'A metadata-based deepfake detection API. '
+                   'Upload a video file and receive a forensic verdict '
+                   '(AUTHENTIC, SUSPICIOUS, or INCONCLUSIVE) based on '
+                   'heuristic analysis of embedded metadata.',
+    'version': '1.0.0',
+    'contact': {
+        'name': 'DeepGuard',
+    },
+}
+swagger = Swagger(app)  # NEW: Initialise Swagger — auto-generates /apidocs
+ 
+# Create uploads folder at module load time
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-
-
+ 
+ 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-
+ 
+ 
 def extract_metadata(filepath):
     """Invoke ExifTool and return parsed metadata dict, or an error dict."""
     try:
@@ -28,8 +43,6 @@ def extract_metadata(filepath):
             ['exiftool', '-json', '-a', '-u', '-g', filepath],
             capture_output=True, text=True, timeout=30
         )
-        # FIX 7: Guard against empty or missing stdout before calling json.loads
-        # Original code called json.loads(res.stdout) without checking — crashes with JSONDecodeError
         if res.returncode != 0 or not res.stdout.strip():
             return {"error": res.stderr.strip() or "ExifTool returned no output"}
         return json.loads(res.stdout)[0]
@@ -39,8 +52,8 @@ def extract_metadata(filepath):
         return {"error": "ExifTool is not installed or not found in PATH. Install with: sudo apt install libimage-exiftool-perl"}
     except Exception as e:
         return {"error": str(e)}
-
-
+ 
+ 
 def flatten_metadata(metadata):
     """Flatten the grouped ExifTool JSON into a single lowercase key-value dict."""
     flat = {}
@@ -51,20 +64,17 @@ def flatten_metadata(metadata):
         else:
             flat[k.lower()] = str(v).lower()
     return flat
-
-
+ 
+ 
 def parse_exiftool_date(date_str):
     """
-    FIX 3: Parse ExifTool date strings into datetime objects for proper comparison.
-    The original code compared raw strings, which breaks when ExifTool appends
-    timezone offsets (e.g. '2024:03:14 09:00:00+01:00'). Raw string comparison
-    then ignores the offset, producing wrong results.
+    Parse ExifTool date strings into datetime objects for proper comparison.
+    Strips timezone offsets before parsing to avoid string comparison errors.
     """
     if not date_str:
         return None
-    # Strip timezone offset (+HH:MM or -HH:MM) before parsing
     for sep in ['+', '-']:
-        if sep in date_str[10:]:          # only strip offset, not date separators
+        if sep in date_str[10:]:
             date_str = date_str[:date_str.index(sep, 10)]
     date_str = date_str.strip()
     for fmt in ('%Y:%m:%d %H:%M:%S', '%Y-%m-%d %H:%M:%S', '%Y:%m:%d'):
@@ -73,76 +83,92 @@ def parse_exiftool_date(date_str):
         except ValueError:
             continue
     return None
-
-
+ 
+ 
 def run_heuristic_checks(metadata):
     """Apply five sequential forensic heuristic rules to extracted metadata."""
     flags = []
     flat  = flatten_metadata(metadata)
-
-        # ── Check 1: Hardware Identifier ────────────────────────────────────────
-    # Expanded to catch standard tags and Android-specific tags
-    HARDWARE_FIELDS = ['make', 'model', 'samsungmodel', 'androidmodel', 'devicemodel', 'manufacturer']
-    found_hw = [f for f in HARDWARE_FIELDS if flat.get(f, '').strip()]
+        # 1. SETUP VARIABLES (Add these now)
+    filetype = flat.get('filetype', '').lower()
     
-    if not found_hw:
+    make_val  = str(flat.get('make', '')).lower()
+    model_val = str(flat.get('model', '')).lower()
+    all_keys  = [str(k).lower() for k in flat.keys()]
+
+    # 2. IDENTIFY DEVICE FAMILY
+    is_android = any(brand in make_val or brand in model_val for brand in ['samsung', 'tecno', 'infinix', 'itel', 'transsion']) or \
+                 any('android' in k for k in all_keys) or \
+                 flat.get('androidversion') is not None
+
+    is_apple = 'apple' in make_val or any('apple' in k for k in all_keys)
+
+ 
+       # --- 1. Universal Device Identification ---
+    # This identifies the "Family" of the device to avoid false positives.
+    
+    make_val  = str(flat.get('make', '')).lower()
+    model_val = str(flat.get('model', '')).lower()
+    all_keys  = [str(k).lower() for k in flat.keys()]
+
+    # Capture itel, Samsung, Tecno, Infinix, etc.
+    is_android = any(brand in make_val or brand in model_val for brand in ['samsung', 'tecno', 'infinix', 'itel', 'transsion', 'google', 'pixel']) or \
+                 any('android' in k for k in all_keys) or \
+                 flat.get('androidversion') is not None
+
+    # Capture iPhone 13 and other Apple devices
+    is_apple = 'apple' in make_val or any('apple' in k for k in all_keys)
+
+
+    # --- 2. Refined Heuristic Checks ---
+
+    # Check 1: Hardware Identifiers
+    # FIX: Valid if we have Make, Model, OR the Android Version (for itel)
+    has_hw_id = bool(flat.get('make') or flat.get('model') or flat.get('androidversion'))
+    
+    if not has_hw_id and not is_android:
         flags.append({
             "flag":     "Missing Hardware Identifiers",
-            "detail":   "No camera Make, Model, or Android identifier found. Authentic smartphone "
-                        "and camera recordings always populate these EXIF fields.",
+            "detail":   "No camera Make, Model, or Android identifier found.",
             "severity": "HIGH"
         })
 
 
-    # ── Check 2: Software Encoder Signature ─────────────────────────────────
-    # FIX: The original code only searched three field names. ExifTool exposes
-    # encoder information under several field names depending on container format.
-    # Expanded to cover all common variants. Also added more deepfake tool signatures.
-    ENCODER_FIELDS = [
-        'encoder', 'software', 'writing application',
-        'writingapplication', 'handler_name', 'com.android.version'
-    ]
-    SUSPICIOUS_ENCODERS = [
-        'ffmpeg', 'libavcodec', 'libx264', 'lavf',
-        'handbrake', 'obs studio', 'x264', 'x265',
-        'deepfacelab', 'openh264', 'faceswap'
-    ]
-    found_enc = next((flat[f] for f in ENCODER_FIELDS if flat.get(f)), "")
-
-    if found_enc and any(s in found_enc for s in SUSPICIOUS_ENCODERS):
+ 
+        # --- Check 2: Encoder / Software Signature ---
+    found_enc = flat.get('encoder') or flat.get('software') or flat.get('writing library')
+    
+    if found_enc and any(x in str(found_enc).lower() for x in ['ffmpeg', 'lavf', 'handbrake', 'premiere', 'capcut', 'topaz']):
         flags.append({
-            "flag":     "Suspicious Encoder Detected",
-            "detail":   f"Encoder field reads: '{found_enc}'. This matches known AI rendering "
-                        "or video processing software, not a hardware camera encoder.",
+            "flag":     "Suspicious Encoder Signature",
+            "detail":   f"Video encoded with {found_enc}. This is common for AI-generated or edited content.",
             "severity": "HIGH"
         })
-    elif not found_enc:
-        # FIX 10: Original code raised HIGH for a missing encoder, causing false positives
-        # on MKV, WebM, and AVI files which legitimately omit the encoder field.
-        # Downgraded to MEDIUM — it contributes to the verdict but is not decisive alone.
+    elif not found_enc and not (is_android or is_apple):
+        # We only flag missing encoder if we CANNOT identify the phone.
+        # itel and iPhones often skip this tag, so we ignore it for them!
         flags.append({
             "flag":     "Encoder Data Absent",
-            "detail":   "No encoder tag found. Inconclusive on its own — some container "
-                        "formats (MKV, WebM, AVI) do not write this field.",
+            "detail":   "No encoder tag found. Inconclusive on its own.",
             "severity": "MEDIUM"
         })
-    # ── Check 3: MakerNotes Presence ────────────────────────────────────────
-    filetype       = flat.get('filetype', '').lower()
-    has_makernotes = bool(flat.get('makernote') or flat.get('makernotes'))
+
+ 
+        # Check 3: MakerNotes / Hardware Signature
+    # FIX: Valid if MakerNotes exist OR if it's an identified Apple device.
+    # ANDROID PROTECTION: If is_android is True, this check is skipped.
+    has_sig = bool(flat.get('makernote') or flat.get('makernotes') or is_apple)
     
-    # Apple strictly writes MakerNotes to videos. Android/Samsung often do not.
-    is_android = any(k in flat for k in ['samsungmodel', 'androidmodel', 'devicemodel']) or 'samsung' in flat.get('make', '').lower()
-    
-    if not has_makernotes and filetype in ('mp4', 'mov', 'quicktime') and not is_android:
+    if not has_sig and not is_android and filetype in ('mp4', 'mov', 'quicktime'):
         flags.append({
             "flag":     "Missing MakerNotes",
-            "detail":   "No proprietary manufacturer sub-block found. Authentic Apple/iOS recordings always include this block.",
+            "detail":   "No proprietary manufacturer signature found.",
             "severity": "HIGH"
         })
 
 
-    # ── Check 4: Timestamp Consistency ──────────────────────────────────────
-    # FIX 3: Use parsed datetime objects, not raw strings.
+
+    # Check 4: Timestamp Consistency
     raw_create = flat.get('createdate') or flat.get('track create date') or ''
     raw_modify  = flat.get('modifydate') or flat.get('track modify date') or ''
     dt_create   = parse_exiftool_date(raw_create)
@@ -154,20 +180,16 @@ def run_heuristic_checks(metadata):
                         f"({raw_create.strip()}). This indicates post-production re-encoding.",
             "severity": "HIGH"
         })
-
-    # ── Check 5: Container Format Mismatch ──────────────────────────────────
-    # FIX 11: Original code flagged MP4 + video/quicktime as a mismatch.
-    # This is completely normal for Apple devices — iPhones record MP4 files
-    # with the video/quicktime MIME type. That check would flag every iPhone video.
-    # Replaced with a genuine mismatch table: only flag truly incompatible pairs.
+ 
+    # Check 5: Container Format Mismatch
     mime = flat.get('mimetype', '')
     GENUINE_MISMATCHES = {
         'mp4':  ['video/x-matroska', 'video/x-flv', 'video/webm'],
         'mov':  ['video/x-matroska', 'video/webm',  'video/x-flv'],
         'mkv':  ['video/mp4', 'video/quicktime',    'video/x-flv'],
         'webm': ['video/mp4', 'video/quicktime',    'video/x-matroska'],
-    }
-    ext = filetype  # ExifTool's FileType field gives the actual container format
+    } 
+    ext = filetype
     if ext in GENUINE_MISMATCHES and any(m in mime for m in GENUINE_MISMATCHES[ext]):
         flags.append({
             "flag":     "Container Format Mismatch",
@@ -175,30 +197,22 @@ def run_heuristic_checks(metadata):
                         "May indicate container re-wrapping.",
             "severity": "LOW"
         })
-
+ 
     return flags
-
-
+ 
+ 
 def generate_verdict(flags):
     """
-    FIX 1 & 2: Revised verdict logic.
-
-    Original problems:
-      - A single HIGH flag (e.g. missing MakerNotes on a legitimate phone video)
-        immediately returned SUSPICIOUS, causing many false positives.
-      - A deepfake with only LOW flags was classified as AUTHENTIC (false negative).
-      - No INCONCLUSIVE state existed, despite the chapter describing one.
-
-    Fixed logic:
-      - 2+ HIGH flags                 → SUSPICIOUS
-      - 1 HIGH + 1+ MEDIUM flags      → SUSPICIOUS
-      - 1 HIGH alone                  → INCONCLUSIVE
-      - 2+ MEDIUM flags alone         → INCONCLUSIVE
-      - No significant flags          → AUTHENTIC
+    Verdict logic:
+      - 2+ HIGH flags              -> SUSPICIOUS
+      - 1 HIGH + 1+ MEDIUM flags   -> SUSPICIOUS
+      - 1 HIGH alone               -> INCONCLUSIVE
+      - 2+ MEDIUM flags alone      -> INCONCLUSIVE
+      - No significant flags       -> AUTHENTIC
     """
     high   = [f for f in flags if f['severity'] == 'HIGH']
     medium = [f for f in flags if f['severity'] == 'MEDIUM']
-
+ 
     if len(high) >= 2:
         return {
             "verdict": "SUSPICIOUS",
@@ -239,8 +253,8 @@ def generate_verdict(flags):
             "hardware-recorded camera footage."
         )
     }
-
-
+ 
+ 
 def compute_sha256(filepath):
     """Compute SHA-256 hash of a file in streaming chunks to handle large files."""
     sha256 = hashlib.sha256()
@@ -248,18 +262,105 @@ def compute_sha256(filepath):
         for chunk in iter(lambda: f.read(8192), b""):
             sha256.update(chunk)
     return sha256.hexdigest()
-
-
+ 
+ 
 @app.route('/')
 def index():
+    """
+    Serve the DeepGuard frontend interface.
+    ---
+    tags:
+      - Frontend
+    responses:
+      200:
+        description: Returns the HTML forensic analysis interface
+    """
     return render_template('index.html')
-
-
+ 
+ 
 @app.route('/analyse', methods=['POST'])
 def analyse():
+    """
+    Analyse a video file for deepfake metadata anomalies.
+    ---
+    tags:
+      - Forensic Analysis
+    consumes:
+      - multipart/form-data
+    parameters:
+      - name: video
+        in: formData
+        type: file
+        required: true
+        description: >
+          Video file to analyse. Supported formats: mp4, mov, avi, mkv, webm, flv.
+          Maximum file size: 500 MB.
+    responses:
+      200:
+        description: Forensic analysis completed successfully
+        schema:
+          type: object
+          properties:
+            sha256:
+              type: string
+              description: SHA-256 cryptographic fingerprint of the uploaded file
+              example: "a3f5c...9d1e"
+            verdict:
+              type: object
+              properties:
+                verdict:
+                  type: string
+                  description: Final forensic verdict
+                  enum: [AUTHENTIC, SUSPICIOUS, INCONCLUSIVE]
+                  example: SUSPICIOUS
+                explanation:
+                  type: string
+                  description: Plain-language explanation of the verdict
+                  example: "2 high-severity anomalies detected."
+            flags:
+              type: array
+              description: List of individual forensic anomalies detected
+              items:
+                type: object
+                properties:
+                  flag:
+                    type: string
+                    example: "Missing Hardware Identifiers"
+                  detail:
+                    type: string
+                    example: "No camera Make or Model found."
+                  severity:
+                    type: string
+                    enum: [HIGH, MEDIUM, LOW]
+                    example: HIGH
+      400:
+        description: No file selected or unsupported file type
+        schema:
+          type: object
+          properties:
+            error:
+              type: string
+              example: "Unsupported file type. Allowed formats: mp4, mov, avi, mkv, webm, flv"
+      413:
+        description: File exceeds the 500 MB size limit
+        schema:
+          type: object
+          properties:
+            error:
+              type: string
+              example: "File too large. Maximum allowed upload size is 500 MB."
+      500:
+        description: ExifTool extraction or internal server error
+        schema:
+          type: object
+          properties:
+            error:
+              type: string
+              example: "ExifTool is not installed or not found in PATH."
+    """
     if 'video' not in request.files:
         return jsonify({"error": "No file part in the request."}), 400
-
+ 
     file = request.files['video']
     if not file or not file.filename:
         return jsonify({"error": "No file selected."}), 400
@@ -267,38 +368,35 @@ def analyse():
         return jsonify({
             "error": "Unsupported file type. Allowed formats: mp4, mov, avi, mkv, webm, flv"
         }), 400
-
+ 
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(file.filename))
     file.save(filepath)
-
+ 
     try:
-        # Compute hash BEFORE metadata extraction so the digest is always captured
         file_hash = compute_sha256(filepath)
-
         meta = extract_metadata(filepath)
         if "error" in meta:
             return jsonify({"error": meta["error"]}), 500
-
+ 
         flags   = run_heuristic_checks(meta)
         verdict = generate_verdict(flags)
-
+ 
         return jsonify({
             "sha256":  file_hash,
             "flags":   flags,
             "verdict": verdict
         })
-
+ 
     finally:
-        # Always delete the temporary file — runs even if an exception is raised
         if os.path.exists(filepath):
             os.remove(filepath)
-
-
+ 
+ 
 @app.errorhandler(413)
 def file_too_large(e):
-    """FIX 9: Return a clean JSON error when upload exceeds MAX_CONTENT_LENGTH."""
+    """Return a clean JSON error when upload exceeds MAX_CONTENT_LENGTH."""
     return jsonify({"error": "File too large. Maximum allowed upload size is 500 MB."}), 413
-
-
+ 
+ 
 if __name__ == '__main__':
     app.run(debug=True)
